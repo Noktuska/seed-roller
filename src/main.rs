@@ -102,7 +102,8 @@ fn main() -> Result<()> {
 
     let options = SerializeOptions::default()
         .serialize_none_to_null(false)
-        .serialize_unit_to_null(false);
+        .serialize_unit_to_null(false)
+        .set_array_metatable(false);
 
     let mut best_spoiler_log: Option<SpoilerLog> = None;
     let mut best_random_seed = 0;
@@ -160,7 +161,7 @@ fn main() -> Result<()> {
                 println!("Successful attempt {attempt_num}/{max_attempts}");
 
                 if let Some(script) = lua_script.as_ref() {
-                    let new_spoiler = lua.to_value(&s)?;
+                    let new_spoiler = lua.to_value_with(&s, options)?;
                     let old_spoiler = if let Some(best_spoiler) = &best_spoiler_log {
                         lua.to_value_with(best_spoiler, options)?
                     } else {

@@ -1,8 +1,8 @@
-use std::path::Path;
+use std::{path::Path, sync::Arc, time::Instant};
 
 use anyhow::{Result, bail};
 use clap::Parser;
-use maprando::{difficulty::{get_full_global, get_link_difficulty_length}, map_repository::MapRepository, preset::PresetData, randomize::{Randomizer, assign_map_areas, filter_links, get_difficulty_tiers, get_objectives, randomize_doors}, settings::RandomizerSettings, spoiler_log::SpoilerLog};
+use maprando::{difficulty::{get_full_global, get_link_difficulty_length}, map_repository::MapRepository, preset::PresetData, randomize::{DifficultyConfig, Randomizer, assign_map_areas, filter_links, get_difficulty_tiers, get_objectives, randomize_doors}, settings::RandomizerSettings, spoiler_log::SpoilerLog};
 use maprando_game::{GameData, LinksDataGroup, Map};
 use mlua::{Function, Lua, LuaSerdeExt, SerializeOptions};
 use rand::{RngCore, SeedableRng, rngs::StdRng};
@@ -32,6 +32,22 @@ struct Args {
 
     #[arg(long)]
     stop_on_success: bool
+}
+
+struct RollArgs {
+    random_seed: Option<usize>,
+    max_attempts: usize,
+    max_map_attempts: usize,
+    max_attempts_per_map: usize,
+    lua: Lua,
+    lua_script: Option<Function>,
+    options: SerializeOptions,
+    map_repo: MapRepository,
+    game_data: GameData,
+    settings: RandomizerSettings,
+    stop_on_success: bool,
+    difficulty_tiers: Vec<DifficultyConfig>,
+    filtered_base_links_data: LinksDataGroup
 }
 
 fn main() -> Result<()> {
@@ -74,9 +90,9 @@ fn main() -> Result<()> {
     
     let map_layout = args.map_layout.clone().unwrap_or("Vanilla".to_string());
     let map_repo = match map_layout.to_ascii_lowercase().as_str() {
-        "vanilla" => &map_repo_vanilla,
-        "standard" => &map_repo_standard,
-        "wild" => &map_repo_wild,
+        "vanilla" => map_repo_vanilla,
+        "standard" => map_repo_standard,
+        "wild" => map_repo_wild,
         _ => bail!("Invalid Map repository: {map_layout}")
     };
 
@@ -105,10 +121,97 @@ fn main() -> Result<()> {
         .serialize_unit_to_null(false)
         .set_array_metatable(false);
 
-    let mut best_spoiler_log: Option<SpoilerLog> = None;
-    let mut best_random_seed = 0;
+    let roll_args = RollArgs {
+        random_seed: args.random_seed,
+        max_attempts,
+        max_map_attempts,
+        max_attempts_per_map,
+        lua,
+        lua_script,
+        options,
+        map_repo,
+        game_data,
+        settings,
+        stop_on_success: args.stop_on_success,
+        difficulty_tiers,
+        filtered_base_links_data
+    };
+    let arc_roll_args = Arc::new(roll_args);
+
+    let num_threads = args.threads.min(attempts);
 
     println!("Rolling seeds...");
+
+    let start = Instant::now();
+
+    let (best_spoiler_log, best_random_seed) = if num_threads == 1 || args.random_seed.is_some() {
+        roll_seeds(arc_roll_args, attempts, 0)?
+    } else {
+        let mut thread_pool = vec![];
+        for thread_idx in 0..num_threads {
+            let arc_clone = arc_roll_args.clone();
+            let thread_attempts = if thread_idx == num_threads - 1 {
+                attempts / num_threads + (attempts % num_threads)
+            } else {
+                attempts / num_threads
+            };
+            thread_pool.push(std::thread::spawn(move || roll_seeds(arc_clone, thread_attempts, thread_idx)));
+        }
+
+        let mut result_vec: Vec<(SpoilerLog, usize)> = vec![];
+        for (thread_idx, thread) in thread_pool.into_iter().enumerate() {
+            let res = thread.join().unwrap()?;
+            if let Some(spoiler_log) = res.0 {
+                result_vec.push((spoiler_log, res.1));
+            }
+            println!("Thread {thread_idx} finished.");
+        }
+
+        println!("Merging results...");
+        if result_vec.is_empty() {
+            (None, 0)
+        } else if let Some(lua_script) = arc_roll_args.lua_script.as_ref() {
+            let (mut best_spoiler_log, mut best_random_seed) = result_vec.pop().unwrap();
+            while let Some((next_spoiler_log, next_random_seed)) = result_vec.pop() {
+                let new_spoiler = arc_roll_args.lua.to_value_with(&next_spoiler_log, arc_roll_args.options)?;
+                let old_spoiler = arc_roll_args.lua.to_value_with(&best_spoiler_log, arc_roll_args.options)?;
+                if lua_script.call::<bool>((new_spoiler, old_spoiler))? {
+                    best_spoiler_log = next_spoiler_log;
+                    best_random_seed = next_random_seed;
+                }
+            }
+
+            (Some(best_spoiler_log), best_random_seed)
+        } else {
+            let res = result_vec.pop().unwrap();
+            (Some(res.0), res.1)
+        }
+    };
+
+    let end = Instant::now();
+    let duration = end - start;
+    println!("Elapsed time: {}s", duration.as_secs_f32());
+
+    if let Some(s) = best_spoiler_log {
+        let mut spoiler_v: Value = serde_json::to_value(&s)?;
+        let spoiler_obj = spoiler_v.as_object_mut().unwrap();
+        spoiler_obj.remove("game_data");
+        spoiler_obj.remove("forward_traversal");
+        spoiler_obj.remove("reverse_traversal");
+
+        let spoiler_str = serde_json::to_string_pretty(&spoiler_v)?;
+        let out_path = format!("spoiler_{best_random_seed}.json");
+        std::fs::write(&out_path, &spoiler_str)?;
+
+        println!("Written Spoiler log to file {out_path}");
+    }
+
+    Ok(())
+}
+
+fn roll_seeds(args: Arc<RollArgs>, attempts: usize, thread_idx: usize) -> Result<(Option<SpoilerLog>, usize)> {
+    let mut best_spoiler_log: Option<SpoilerLog> = None;
+    let mut best_random_seed = 0;
 
     'reroll_seed: for i in 0..attempts {
         let random_seed = args.random_seed.unwrap_or_else(get_random_seed);
@@ -119,35 +222,35 @@ fn main() -> Result<()> {
         let mut attempt_num = 0;
         let mut map_batch: Vec<Map> = vec![];
 
-        println!("Reroll seed {i}/{}, seed: {random_seed}", attempts);
+        println!("[{thread_idx}] Reroll seed {i}/{}, seed: {random_seed}", attempts);
 
-        for _ in 0..max_map_attempts {
+        for _ in 0..args.max_map_attempts {
             let map_seed = (rng.next_u64() & 0xFFFFFFFF) as usize;
             let door_randomization_seed = (rng.next_u64() & 0xFFFFFFFF) as usize;
 
             if map_batch.is_empty() {
-                map_batch = map_repo.get_map_batch(map_seed, &game_data)?;
+                map_batch = args.map_repo.get_map_batch(map_seed, &args.game_data)?;
             }
             let mut map = map_batch.pop().unwrap();
 
-            if !assign_map_areas(&mut map, &settings, map_seed, &game_data) {
+            if !assign_map_areas(&mut map, &args.settings, map_seed, &args.game_data) {
                 continue;
             }
 
-            let objectives = get_objectives(&settings, Some(&map), &game_data, &mut rng);
-            let locked_door_data = randomize_doors(&game_data, &map, &settings, &objectives, door_randomization_seed);
+            let objectives = get_objectives(&args.settings, Some(&map), &args.game_data, &mut rng);
+            let locked_door_data = randomize_doors(&args.game_data, &map, &args.settings, &objectives, door_randomization_seed);
             let randomizer = Randomizer::new(
                 &map,
                 &locked_door_data,
                 objectives.clone(),
-                &settings,
-                &difficulty_tiers,
-                &game_data,
-                &filtered_base_links_data,
+                &args.settings,
+                &args.difficulty_tiers,
+                &args.game_data,
+                &args.filtered_base_links_data,
                 &mut rng
             );
 
-            for _ in 0..max_attempts_per_map {
+            for _ in 0..args.max_attempts_per_map {
                 let item_placement_seed = (rng.next_u64() & 0xFFFFFFFF) as usize;
                 attempt_num += 1;
 
@@ -158,12 +261,12 @@ fn main() -> Result<()> {
                     continue;
                 };
 
-                println!("Successful attempt {attempt_num}/{max_attempts}");
+                println!("[{thread_idx}] Successful attempt {attempt_num}/{}", args.max_attempts);
 
-                if let Some(script) = lua_script.as_ref() {
-                    let new_spoiler = lua.to_value_with(&s, options)?;
+                if let Some(script) = args.lua_script.as_ref() {
+                    let new_spoiler = args.lua.to_value_with(&s, args.options)?;
                     let old_spoiler = if let Some(best_spoiler) = &best_spoiler_log {
-                        lua.to_value_with(best_spoiler, options)?
+                        args.lua.to_value_with(best_spoiler, args.options)?
                     } else {
                         mlua::Value::Nil
                     };
@@ -185,21 +288,7 @@ fn main() -> Result<()> {
         }
     }
 
-    if let Some(s) = best_spoiler_log {
-        let mut spoiler_v: Value = serde_json::to_value(&s)?;
-        let spoiler_obj = spoiler_v.as_object_mut().unwrap();
-        spoiler_obj.remove("game_data");
-        spoiler_obj.remove("forward_traversal");
-        spoiler_obj.remove("reverse_traversal");
-
-        let spoiler_str = serde_json::to_string_pretty(&spoiler_v)?;
-        let out_path = format!("spoiler_{best_random_seed}.json");
-        std::fs::write(&out_path, &spoiler_str)?;
-
-        println!("Written Spoiler log to file {out_path}");
-    }
-
-    Ok(())
+    Ok((best_spoiler_log, best_random_seed))
 }
 
 fn get_random_seed() -> usize {

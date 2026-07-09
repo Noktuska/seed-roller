@@ -39,8 +39,7 @@ struct RollArgs {
     max_attempts: usize,
     max_map_attempts: usize,
     max_attempts_per_map: usize,
-    lua: Lua,
-    lua_script: Option<Function>,
+    lua_path: Option<String>,
     options: SerializeOptions,
     map_repo: MapRepository,
     game_data: GameData,
@@ -108,14 +107,6 @@ fn main() -> Result<()> {
 
     println!("Loading Lua Script...");
 
-    let lua = Lua::new();
-    let lua_script = if let Some(lua_path) = &args.lua_path {
-        let lua_src = std::fs::read_to_string(&lua_path)?;
-        Some(lua.load(lua_src).eval::<Function>()?)
-    } else {
-        None
-    };
-
     let options = SerializeOptions::default()
         .serialize_none_to_null(false)
         .serialize_unit_to_null(false)
@@ -126,8 +117,7 @@ fn main() -> Result<()> {
         max_attempts,
         max_map_attempts,
         max_attempts_per_map,
-        lua,
-        lua_script,
+        lua_path: args.lua_path,
         options,
         map_repo,
         game_data,
@@ -168,13 +158,22 @@ fn main() -> Result<()> {
         }
 
         println!("Merging results...");
+
+        let lua = Lua::new();
+        let lua_script = if let Some(lua_path) = &arc_roll_args.lua_path {
+            let lua_src = std::fs::read_to_string(&lua_path)?;
+            Some(lua.load(lua_src).eval::<Function>()?)
+        } else {
+            None
+        };
+
         if result_vec.is_empty() {
             (None, 0)
-        } else if let Some(lua_script) = arc_roll_args.lua_script.as_ref() {
+        } else if let Some(lua_script) = lua_script.as_ref() {
             let (mut best_spoiler_log, mut best_random_seed) = result_vec.pop().unwrap();
             while let Some((next_spoiler_log, next_random_seed)) = result_vec.pop() {
-                let new_spoiler = arc_roll_args.lua.to_value_with(&next_spoiler_log, arc_roll_args.options)?;
-                let old_spoiler = arc_roll_args.lua.to_value_with(&best_spoiler_log, arc_roll_args.options)?;
+                let new_spoiler = lua.to_value_with(&next_spoiler_log, arc_roll_args.options)?;
+                let old_spoiler = lua.to_value_with(&best_spoiler_log, arc_roll_args.options)?;
                 if lua_script.call::<bool>((new_spoiler, old_spoiler))? {
                     best_spoiler_log = next_spoiler_log;
                     best_random_seed = next_random_seed;
@@ -213,6 +212,14 @@ fn roll_seeds(args: Arc<RollArgs>, attempts: usize, thread_idx: usize) -> Result
     let mut best_spoiler_log: Option<SpoilerLog> = None;
     let mut best_random_seed = 0;
 
+    let lua = Lua::new();
+    let lua_script = if let Some(lua_path) = &args.lua_path {
+        let lua_src = std::fs::read_to_string(&lua_path)?;
+        Some(lua.load(lua_src).eval::<Function>()?)
+    } else {
+        None
+    };
+
     'reroll_seed: for i in 0..attempts {
         let random_seed = args.random_seed.unwrap_or_else(get_random_seed);
         let mut rng_seed = [0u8; 32];
@@ -222,7 +229,7 @@ fn roll_seeds(args: Arc<RollArgs>, attempts: usize, thread_idx: usize) -> Result
         let mut attempt_num = 0;
         let mut map_batch: Vec<Map> = vec![];
 
-        println!("[{thread_idx}] Reroll seed {i}/{}, seed: {random_seed}", attempts);
+        println!("[{thread_idx}] Reroll seed {}/{}, seed: {random_seed}", i + 1, attempts);
 
         for _ in 0..args.max_map_attempts {
             let map_seed = (rng.next_u64() & 0xFFFFFFFF) as usize;
@@ -263,10 +270,10 @@ fn roll_seeds(args: Arc<RollArgs>, attempts: usize, thread_idx: usize) -> Result
 
                 println!("[{thread_idx}] Successful attempt {attempt_num}/{}", args.max_attempts);
 
-                if let Some(script) = args.lua_script.as_ref() {
-                    let new_spoiler = args.lua.to_value_with(&s, args.options)?;
+                if let Some(script) = lua_script.as_ref() {
+                    let new_spoiler = lua.to_value_with(&s, args.options)?;
                     let old_spoiler = if let Some(best_spoiler) = &best_spoiler_log {
-                        args.lua.to_value_with(best_spoiler, args.options)?
+                        lua.to_value_with(best_spoiler, args.options)?
                     } else {
                         mlua::Value::Nil
                     };

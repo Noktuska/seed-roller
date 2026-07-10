@@ -1,4 +1,4 @@
-use std::{path::Path, sync::Arc, time::Instant};
+use std::{path::Path, sync::{Arc, atomic::{AtomicBool, Ordering}}, time::Instant};
 
 use anyhow::{Result, bail};
 use clap::Parser;
@@ -127,6 +127,14 @@ fn main() -> Result<()> {
         filtered_base_links_data
     };
     let arc_roll_args = Arc::new(roll_args);
+    let abort = Arc::new(AtomicBool::new(false));
+
+    {
+        let abort_clone = abort.clone();
+        if let Err(e) = ctrlc::set_handler(move || abort_clone.store(true, Ordering::Relaxed)) {
+            println!("WARNING: Could not attach CTRL+C handler: {e:?}");
+        }
+    }
 
     let num_threads = args.threads.min(attempts);
 
@@ -135,17 +143,18 @@ fn main() -> Result<()> {
     let start = Instant::now();
 
     let (best_spoiler_log, best_random_seed) = if num_threads == 1 || args.random_seed.is_some() {
-        roll_seeds(arc_roll_args, attempts, 0)?
+        roll_seeds(arc_roll_args, attempts, 0, abort.clone())?
     } else {
         let mut thread_pool = vec![];
         for thread_idx in 0..num_threads {
             let arc_clone = arc_roll_args.clone();
+            let abort_clone = abort.clone();
             let thread_attempts = if thread_idx == num_threads - 1 {
                 attempts / num_threads + (attempts % num_threads)
             } else {
                 attempts / num_threads
             };
-            thread_pool.push(std::thread::spawn(move || roll_seeds(arc_clone, thread_attempts, thread_idx)));
+            thread_pool.push(std::thread::spawn(move || roll_seeds(arc_clone, thread_attempts, thread_idx, abort_clone)));
         }
 
         let mut result_vec: Vec<(SpoilerLog, usize)> = vec![];
@@ -208,7 +217,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn roll_seeds(args: Arc<RollArgs>, attempts: usize, thread_idx: usize) -> Result<(Option<SpoilerLog>, usize)> {
+fn roll_seeds(args: Arc<RollArgs>, attempts: usize, thread_idx: usize, abort: Arc<AtomicBool>) -> Result<(Option<SpoilerLog>, usize)> {
     let mut best_spoiler_log: Option<SpoilerLog> = None;
     let mut best_random_seed = 0;
 
@@ -281,12 +290,17 @@ fn roll_seeds(args: Arc<RollArgs>, attempts: usize, thread_idx: usize) -> Result
                         best_spoiler_log = Some(s);
                         best_random_seed = random_seed;
                         if args.stop_on_success {
+                            abort.store(true, Ordering::Relaxed);
                             break 'reroll_seed;
                         }
                     }
                 } else if best_spoiler_log.is_none() {
                     best_spoiler_log = Some(s);
                     best_random_seed = random_seed;
+                    break 'reroll_seed;
+                }
+
+                if abort.load(Ordering::Relaxed) {
                     break 'reroll_seed;
                 }
 

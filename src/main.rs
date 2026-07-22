@@ -230,6 +230,11 @@ fn roll_seeds(args: Arc<RollArgs>, attempts: usize, thread_idx: usize, abort: Ar
     };
 
     'reroll_seed: for i in 0..attempts {
+        if abort.load(Ordering::Relaxed) {
+            println!("[{thread_idx}] ABORT");
+            break 'reroll_seed;
+        }
+
         let random_seed = args.random_seed.unwrap_or_else(get_random_seed);
         let mut rng_seed = [0u8; 32];
         rng_seed[..8].copy_from_slice(&random_seed.to_le_bytes());
@@ -297,10 +302,7 @@ fn roll_seeds(args: Arc<RollArgs>, attempts: usize, thread_idx: usize, abort: Ar
                 } else if best_spoiler_log.is_none() {
                     best_spoiler_log = Some(s);
                     best_random_seed = random_seed;
-                    break 'reroll_seed;
-                }
-
-                if abort.load(Ordering::Relaxed) {
+                    abort.store(true, Ordering::Relaxed);
                     break 'reroll_seed;
                 }
 
